@@ -1,0 +1,184 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List, Optional
+from datetime import datetime, timedelta
+import yfinance as yf
+import pandas as pd
+import numpy as np
+
+app = FastAPI(title="Quant Dashboard API", version="1.0.0")
+
+# Configuration CORS pour le frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Models Pydantic
+class AssetRequest(BaseModel):
+    ticker: str
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+
+class PortfolioRequest(BaseModel):
+    tickers: List[str]
+    weights: List[float]
+    start_date: Optional[str] = None
+
+class MetricsResponse(BaseModel):
+    ticker: str
+    total_return: float
+    annualized_return: float
+    volatility: float
+    sharpe_ratio: float
+    max_drawdown: float
+
+# Fonctions de calcul
+def calculate_returns(prices):
+    """Calcule les rendements"""
+    return prices.pct_change().dropna()
+
+def calculate_sharpe_ratio(returns, risk_free_rate=0.02):
+    """Calcule le ratio de Sharpe"""
+    excess_returns = returns - risk_free_rate / 252
+    return np.sqrt(252) * excess_returns.mean() / returns.std()
+
+def calculate_max_drawdown(prices):
+    """Calcule le drawdown maximum"""
+    cumulative = (1 + prices.pct_change()).cumprod()
+    running_max = cumulative.expanding().max()
+    drawdown = (cumulative - running_max) / running_max
+    return drawdown.min()
+
+# Routes API
+@app.get("/")
+async def root():
+    return {"message": "Quant Dashboard API", "status": "running"}
+
+@app.get("/api/v1/asset/{ticker}/price")
+async def get_asset_price(ticker: str, period: str = "1y"):
+    """Récupère les prix historiques d'un actif"""
+    try:
+        stock = yf.Ticker(ticker)
+        hist = stock.history(period=period)
+
+        if hist.empty:
+            raise HTTPException(status_code=404, detail=f"No data found for {ticker}")
+
+        # Conversion en format JSON
+        data = {
+            "ticker": ticker,
+            "dates": hist.index.strftime('%Y-%m-%d').tolist(),
+            "prices": hist['Close'].tolist(),
+            "volume": hist['Volume'].tolist()
+        }
+
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/asset/metrics")
+async def calculate_metrics(request: AssetRequest):
+    """Calcule les métriques quantitatives pour un actif"""
+    try:
+        ticker = request.ticker
+        start = request.start_date or (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+        end = request.end_date or datetime.now().strftime('%Y-%m-%d')
+
+        # Récupération des données
+        stock = yf.Ticker(ticker)
+        hist = stock.history(start=start, end=end)
+
+        if hist.empty:
+            raise HTTPException(status_code=404, detail=f"No data found for {ticker}")
+
+        prices = hist['Close']
+        returns = calculate_returns(prices)
+
+        # Calcul des métriques
+        total_return = (prices.iloc[-1] / prices.iloc[0] - 1) * 100
+        annualized_return = returns.mean() * 252 * 100
+        volatility = returns.std() * np.sqrt(252) * 100
+        sharpe = calculate_sharpe_ratio(returns)
+        max_dd = calculate_max_drawdown(prices) * 100
+
+        return MetricsResponse(
+            ticker=ticker,
+            total_return=round(total_return, 2),
+            annualized_return=round(annualized_return, 2),
+            volatility=round(volatility, 2),
+            sharpe_ratio=round(sharpe, 2),
+            max_drawdown=round(max_dd, 2)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/v1/portfolio/performance")
+async def calculate_portfolio_performance(request: PortfolioRequest):
+    """Calcule la performance d'un portefeuille"""
+    try:
+        if len(request.tickers) != len(request.weights):
+            raise HTTPException(status_code=400, detail="Tickers and weights must have the same length")
+
+        if abs(sum(request.weights) - 1.0) > 0.01:
+            raise HTTPException(status_code=400, detail="Weights must sum to 1.0")
+
+        start = request.start_date or (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+
+        # Récupération des données pour tous les actifs
+        all_prices = pd.DataFrame()
+        for ticker in request.tickers:
+            stock = yf.Ticker(ticker)
+            hist = stock.history(start=start)
+            all_prices[ticker] = hist['Close']
+
+        # Calcul des rendements du portefeuille
+        returns = all_prices.pct_change().dropna()
+        portfolio_returns = (returns * request.weights).sum(axis=1)
+
+        # Métriques du portefeuille
+        total_return = ((1 + portfolio_returns).cumprod().iloc[-1] - 1) * 100
+        annualized_return = portfolio_returns.mean() * 252 * 100
+        volatility = portfolio_returns.std() * np.sqrt(252) * 100
+        sharpe = calculate_sharpe_ratio(portfolio_returns)
+
+        return {
+            "tickers": request.tickers,
+            "weights": request.weights,
+            "total_return": round(total_return, 2),
+            "annualized_return": round(annualized_return, 2),
+            "volatility": round(volatility, 2),
+            "sharpe_ratio": round(sharpe, 2)
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/v1/market/trending")
+async def get_trending_stocks():
+    """Récupère les actions tendances (exemple statique)"""
+    # Dans un vrai projet, tu récupérerais ça d'une vraie source
+    trending = ["AAPL", "MSFT", "GOOGL", "AMZN", "TSLA"]
+
+    result = []
+    for ticker in trending:
+        try:
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            result.append({
+                "ticker": ticker,
+                "name": info.get("longName", ticker),
+                "price": info.get("currentPrice", 0),
+                "change_percent": info.get("regularMarketChangePercent", 0)
+            })
+        except:
+            continue
+
+    return {"trending_stocks": result}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
